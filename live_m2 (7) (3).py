@@ -168,8 +168,8 @@ def span_phrase(c):
 
 
 def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=None, span=None, candle='every', lot_amount=None, skip=None, entry='above', method=1, state=None, combo=None):
-    """GENERATOR version of Method 2. Yields ('NEXT', bar_date) before every bar and ('ASK', bar_date) when a FLAT stock wants to
-    open a NEW position - the caller answers True / False (portfolio limit). state['lots'] always shows the lots held.
+    """GENERATOR version of Method 2. Yields ('NEXT', bar_date) before every bar and ('ASK', bar_date, fresh) when a FLAT stock wants to
+    open a NEW position (fresh = the stock was NOT in the entry zone on its previous bar) - the caller answers True / False (portfolio limit). state['lots'] always shows the lots held.
     run_m2() below drives it for one stock; run_group() drives many stocks in time order.
     Method 2 (Google-sheet logic).
     span   : None = exit on Profit target %;  'A' / 'B' / 'A&B' / 'AorB' = exit when Close falls below that span
@@ -183,7 +183,20 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
              'weekly' = at most 1 lot per week (first candle of the period that closes above the cloud).
     Returns trades DataFrame; trace (list) gets one dict per bar."""
     full = add_ichimoku_cloud(df)
+
+    def in_zone(r):                                                  # is the ENTRY condition met on this bar?
+        p_ = r['Close']
+        if entry == 'above':
+            return bool(r['AboveCloud'])
+        if entry == 'below':
+            return bool(p_ < r['CloudBottom'])
+        return bool(r['CloudBottom'] <= p_ <= r['CloudTop'])         # inside the cloud
+
+    prev_above = None                                                # entry condition on the bar BEFORE the current one (None = unknown)
     if start_date is not None:   # cloud uses full history, simulation starts flat from start_date
+        _pre = full[(full['Date'] < pd.Timestamp(start_date)) & full['CloudTop'].notna() & full['CloudBottom'].notna()]
+        if len(_pre):
+            prev_above = in_zone(_pre.iloc[-1])
         full = full[full['Date'] >= pd.Timestamp(start_date)].reset_index(drop=True)
     rows = full.to_dict('records')
     span_hit = SPAN_RULES.get(span)
@@ -222,17 +235,14 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         if skip and any(a < date < b for a, b in skip):
             continue
         yield ('NEXT', date)
-        if entry == 'above':                                                                       # entry condition met?
-            above = bool(row['AboveCloud'])
-        elif entry == 'below':
-            above = bool(price < row['CloudBottom'])
-        else:                                                                                      # inside the cloud
-            above = bool(row['CloudBottom'] <= price <= row['CloudTop'])
+        above = in_zone(row)                                                                       # entry condition met?
+        fresh = prev_above is False          # on the previous bar it was NOT in the entry zone (below / inside the cloud) -> FRESH signal
+        prev_above = above
         bought, prev_lots, blocked = False, 0, False
         if m2_first:
             m2_first = False
             if above:
-                if (yield ('ASK', date)):
+                if (yield ('ASK', date, fresh)):
                     m2_lots = 1
                 else:
                     blocked = True                          # portfolio full -> no new position on this bar
@@ -244,7 +254,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             can_buy = candle == 'every' or pkey(date) != last_buy_key
             if not above or not can_buy:
                 pass
-            elif m2_lots == 0 and not (yield ('ASK', date)):
+            elif m2_lots == 0 and not (yield ('ASK', date, fresh)):
                 blocked = True                              # flat stock, but the portfolio limit is reached
             elif m2_prev_exit:
                 m2_lots, bought = 1, True
@@ -289,7 +299,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
         state['lots'] = m2_lots
         if trace is not None:
             trace.append({'Date': date, 'Close': price, 'CloudTop': row['CloudTop'],
-                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Lots': m2_lots, 'Bought': bought, 'Blocked': blocked, 'Qty': m2_qty,
+                          'CloudBottom': row['CloudBottom'], 'Above': above, 'Fresh': bool(above and fresh), 'Lots': m2_lots, 'Bought': bought, 'Blocked': blocked, 'Qty': m2_qty,
                           'AvgPrice': None if not m2_avg else round(m2_avg, 4),
                           'Action': 'EXIT' if m2_prev_exit else ''})
 
@@ -319,8 +329,13 @@ def run_m2(*a, **k):
 
 
 def run_group(items, limit):
-    """Step many stocks together in TIME order. A flat stock may open a new position only while fewer than `limit` stocks
-    hold one; stocks that already hold lots keep scaling in. Same bar -> list order. -> {index: trades DataFrame}"""
+    """Step many stocks together, bar by bar (time order), with a portfolio limit of `limit` stocks.
+    Per bar:
+      1) every stock of that bar is stepped first - holders scale in or EXIT, so the freed slots are known BEFORE anybody is let in;
+      2) the flat stocks that want a NEW position ('ASK') are served in PRIORITY order until the limit is reached:
+           a) FRESH signals first - the stock was below / inside the cloud on its previous bar and has just come into the entry zone;
+           b) then the stocks that were already waiting (in the entry zone before) - inside each group in list (rank) order.
+    A stock that already holds lots keeps scaling in (no slot needed).  -> {index: trades DataFrame}"""
     heap, results = [], {}
     for i, it in enumerate(items):
         try:
@@ -328,22 +343,48 @@ def run_group(items, limit):
             heapq.heappush(heap, (msg[1], i))
         except StopIteration as e:
             results[i] = e.value
+
+    def _done(i, e):
+        results[i] = e.value
+        if items[i].get('stopped'):                                    # exited strategy: its slot is free from now on
+            items[i]['state']['lots'] = 0
+
     while heap:
-        _, i = heapq.heappop(heap)
-        it = items[i]
-        try:
-            msg = it['g'].send(None)                                   # process this bar
-            while msg[0] == 'ASK':
-                holders = [j for j, o in enumerate(items) if j != i and o['state']['lots'] > 0]
-                held = len(holders)
-                it.setdefault('ask_log', []).append((msg[1], held < limit,                 # (bar, granted?, who held the slots)
-                                                     [(items[j].get('s') or {}).get('symbol', str(j)) for j in holders]))
-                msg = it['g'].send(held < limit)
-            heapq.heappush(heap, (msg[1], i))
-        except StopIteration as e:
-            results[i] = e.value
-            if it.get('stopped'):                                      # exited strategy: its slot is free from now on
-                it['state']['lots'] = 0
+        bar = heap[0][0]
+        batch = []
+        while heap and heap[0][0] == bar:                              # all stocks that have a candle at this time
+            batch.append(heapq.heappop(heap)[1])
+        batch.sort()
+        pending = []
+        for i in batch:                                                # phase 1: process the bar (exits free their slots here)
+            try:
+                msg = items[i]['g'].send(None)
+                if msg[0] == 'ASK':
+                    pending.append((i, msg))                           # flat stock waiting for an answer
+                else:
+                    heapq.heappush(heap, (msg[1], i))
+            except StopIteration as e:
+                _done(i, e)
+        if not pending:
+            continue
+        asking = {i for i, _ in pending}
+        holders = [j for j, o in enumerate(items) if j not in asking and o['state']['lots'] > 0]
+        pending.sort(key=lambda p: (0 if (len(p[1]) > 2 and p[1][2]) else 1, p[0]))     # fresh first, then list order
+        for i, msg in pending:                                         # phase 2: hand out the free slots
+            it = items[i]
+            granted = len(holders) < limit
+            it.setdefault('ask_log', []).append((msg[1], granted,                          # (bar, granted?, who held the slots, fresh?)
+                                                 [(items[j].get('s') or {}).get('symbol', str(j)) for j in holders],
+                                                 bool(len(msg) > 2 and msg[2])))
+            if granted:
+                holders.append(i)
+            try:
+                nxt = it['g'].send(granted)
+                while nxt[0] == 'ASK':
+                    nxt = it['g'].send(False)
+                heapq.heappush(heap, (nxt[1], i))
+            except StopIteration as e:
+                _done(i, e)
     return results
 
 
@@ -1896,6 +1937,7 @@ def group_entry_view(fol, members, stats, evs, lim):
         ev = evs.get((fol, f))
         info = {'entries': 0, 'first': None, 'last_exit': None, 'lots': 0}
         flat, wait_ = True, False
+        fresh_at = {a_[0] for a_ in ((ev or {}).get('ask_log') or []) if a_[1] and len(a_) > 3 and a_[3]}
         if ev is not None and not ev['tr'].empty:
             for _, r in ev['tr'].iterrows():
                 tm, sig = r['Date'], r['Signal']
@@ -1909,7 +1951,7 @@ def group_entry_view(fol, members, stats, evs, lim):
                     flat = False
                     info['entries'] += 1
                     info['first'] = info['first'] or tm
-                    events.append((tm, 0, s['symbol'], 'ENTRY - slot taken', int(r['Lots'])))
+                    events.append((tm, 0, s['symbol'], 'ENTRY - slot taken' + (' (fresh cross - priority)' if tm in fresh_at else ''), int(r['Lots'])))
                 elif sig in ('EXIT', 'BUY+EXIT') and not flat:
                     flat = True
                     info['last_exit'] = tm
