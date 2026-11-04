@@ -88,7 +88,7 @@ QTY_OPTIONS = [1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 500, 1000]
 # The timeframe of the candles / cloud itself is chosen separately (Timeframe row under it).
 CANDLE_OPTIONS = {'Every candle': 'every', 'Every 30 min': 'min30', 'Every 1 hour': 'hour1', 'Every 2 hours': 'hour2',
                   'Every 4 hours': 'hour4', 'Daily': 'daily', 'Weekly': 'weekly'}
-INTERVAL_MIN = {'min30': 30, 'hour1': 60, 'hour2': 120, 'hour4': 240}          # intraday investment intervals (minutes, counted from the session open)
+INTERVAL_MIN = {'min30': 30, 'hour1': 60, 'hour2': 120, 'hour4': 240}          # intraday investment intervals (minutes, counted from the LAST BUY)
 
 
 def exit_label(x):
@@ -184,12 +184,12 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     entry  : 'above' = buy while Close is ABOVE the cloud top;  'below' = BELOW the cloud bottom;  'inside' = INSIDE the cloud.
     skip   : list of (from, to) timestamps - bars inside are ignored (strategy was paused; no buy / exit then).
     candle : 'every' = buy 1 lot on every candle above the cloud;  'min30' / 'hour1' / 'hour2' / 'hour4' = at most 1 lot per 30 min / 1 / 2 / 4
-             hours (the candles / cloud can be 3m, 5m ... - the cloud is watched on every candle, buying is allowed once per interval);
+             hours (the candles / cloud can be 3m, 5m ... - the cloud is watched on every candle; the next lot is bought only after that
+             many minutes have passed since the LAST BUY - exact gap, not clock slots);
              'daily' = at most 1 lot per day;
              'weekly' = at most 1 lot per week (first candle of the period that closes above the cloud).
     Returns trades DataFrame; trace (list) gets one dict per bar."""
     full = add_ichimoku_cloud(df)
-    day_open = full.groupby(full['Date'].dt.date)['Date'].min().to_dict() if candle in INTERVAL_MIN else {}   # first bar of every session
 
     def in_zone(r):                                                  # is the ENTRY condition met on this bar?
         p_ = r['Close']
@@ -209,10 +209,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     span_hit = SPAN_RULES.get(span)
     combo_logic = (combo or {}).get('logic')                # 'and' = ALL chosen exits must be true on the same bar, 'or' = ANY one
 
-    def pkey(d):
-        if candle in INTERVAL_MIN:                           # 1 lot per N minutes, counted from the session open (09:15, 10:15 ... for 1 hour)
-            o_ = day_open.get(d.date(), d)
-            return (d.date(), int((d - o_).total_seconds() // 60 // INTERVAL_MIN[candle]))
+    def pkey(d):                                             # only for 'daily' / 'weekly' (intraday intervals use last_buy_time)
         if candle == 'daily':
             return d.date()
         if candle == 'weekly':
@@ -237,6 +234,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     m2_first, m2_lots, m2_avg, m2_prev_exit, m2_seg_start = True, 0, None, False, None
     m2_qty, m2_cost = 0.0, 0.0                     # units held and money spent (avg price = cost / units)
     last_buy_key = None
+    last_buy_time = None                                     # time of the last BUY (intraday 'Buy on' intervals)
 
     for row in rows:
         if pd.isna(row['CloudTop']) or pd.isna(row['CloudBottom']):
@@ -259,9 +257,15 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
             bought = m2_lots == 1
             if m2_lots == 1:
                 last_buy_key = pkey(date)
+                last_buy_time = date
         else:
             prev_lots, bought = m2_lots, False
-            can_buy = candle == 'every' or pkey(date) != last_buy_key
+            if candle == 'every':
+                can_buy = True
+            elif candle in INTERVAL_MIN:                     # exact gap since the last buy (12:03 buy -> next 12:33)
+                can_buy = last_buy_time is None or (date - last_buy_time) >= pd.Timedelta(minutes=INTERVAL_MIN[candle])
+            else:
+                can_buy = pkey(date) != last_buy_key
             if not above or not can_buy:
                 pass
             elif m2_lots == 0 and not (yield ('ASK', date, fresh)):
@@ -272,6 +276,7 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
                 m2_lots, bought = m2_lots + 1, True
             if bought:
                 last_buy_key = pkey(date)
+                last_buy_time = date
         if bought:                                         # avg price changes ONLY when a lot is bought
             q = (lot_amount / price) if lot_amount else lot_qty
             if prev_lots == 0:
