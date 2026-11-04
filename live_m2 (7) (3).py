@@ -84,7 +84,11 @@ METHOD_OPTIONS = {'Method 1 - exit at any lot count': 1, 'Method 2 - exit only a
 M3_EXIT = 'Below cloud (in profit)'                              # the fixed exit of Method 3 files (no profit target / span)
 AMOUNT_OPTIONS = [1000, 5000, 10000, 25000, 50000, 100000, 200000, 500000]
 QTY_OPTIONS = [1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 500, 1000]
-CANDLE_OPTIONS = {'Every candle': 'every', 'Daily': 'daily', 'Weekly': 'weekly'}
+# 'Buy on' = the INVESTMENT timeframe: how often a (new) lot may be bought while the price is in the entry zone.
+# The timeframe of the candles / cloud itself is chosen separately (Timeframe row under it).
+CANDLE_OPTIONS = {'Every candle': 'every', 'Every 30 min': 'min30', 'Every 1 hour': 'hour1', 'Every 2 hours': 'hour2',
+                  'Every 4 hours': 'hour4', 'Daily': 'daily', 'Weekly': 'weekly'}
+INTERVAL_MIN = {'min30': 30, 'hour1': 60, 'hour2': 120, 'hour4': 240}          # intraday investment intervals (minutes, counted from the session open)
 
 
 def exit_label(x):
@@ -179,10 +183,13 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
              (span / cloud exits stay active at any lot count).
     entry  : 'above' = buy while Close is ABOVE the cloud top;  'below' = BELOW the cloud bottom;  'inside' = INSIDE the cloud.
     skip   : list of (from, to) timestamps - bars inside are ignored (strategy was paused; no buy / exit then).
-    candle : 'every' = buy 1 lot on every candle above the cloud;  'daily' = at most 1 lot per day;
+    candle : 'every' = buy 1 lot on every candle above the cloud;  'min30' / 'hour1' / 'hour2' / 'hour4' = at most 1 lot per 30 min / 1 / 2 / 4
+             hours (the candles / cloud can be 3m, 5m ... - the cloud is watched on every candle, buying is allowed once per interval);
+             'daily' = at most 1 lot per day;
              'weekly' = at most 1 lot per week (first candle of the period that closes above the cloud).
     Returns trades DataFrame; trace (list) gets one dict per bar."""
     full = add_ichimoku_cloud(df)
+    day_open = full.groupby(full['Date'].dt.date)['Date'].min().to_dict() if candle in INTERVAL_MIN else {}   # first bar of every session
 
     def in_zone(r):                                                  # is the ENTRY condition met on this bar?
         p_ = r['Close']
@@ -203,6 +210,9 @@ def m2_gen(df, profit_target_pct, max_lots, start_date=None, lot_qty=1.0, trace=
     combo_logic = (combo or {}).get('logic')                # 'and' = ALL chosen exits must be true on the same bar, 'or' = ANY one
 
     def pkey(d):
+        if candle in INTERVAL_MIN:                           # 1 lot per N minutes, counted from the session open (09:15, 10:15 ... for 1 hour)
+            o_ = day_open.get(d.date(), d)
+            return (d.date(), int((d - o_).total_seconds() // 60 // INTERVAL_MIN[candle]))
         if candle == 'daily':
             return d.date()
         if candle == 'weekly':
@@ -1376,7 +1386,7 @@ def page_builder():
                 lbl('Max lots (one file each)')
                 lots_list = checkbox_dropdown('Select lots', LOTS_OPTIONS, [10], 'lots')
             with c2:
-                lbl('Buy on (one file each)')
+                lbl('Buy on - investment timeframe (one file each)')
                 candles = checkbox_dropdown('Select candle', list(CANDLE_OPTIONS), ['Every candle'], 'candle')
             with c3:
                 lbl('Price vs cloud (one file each)')
@@ -1389,20 +1399,25 @@ def page_builder():
                                                 'taken. Another stock can enter only when one of the open stocks has fully exited. '
                                                 'Stocks already open can still add lots up to Max lots.')
             # every ticked Buy-on mode gets its own timeframe picker (1m ... 1H, 4H, 1D) - one file per mode x timeframe
-            TF_DEFAULT = {'Every candle': ['1D'], 'Daily': ['1H'], 'Weekly': ['1D']}
+            TF_DEFAULT = {'Every candle': ['1D'], 'Every 30 min': ['5m'], 'Every 1 hour': ['3m'], 'Every 2 hours': ['5m'], 'Every 4 hours': ['5m'],
+                          'Daily': ['1H'], 'Weekly': ['1D']}
             mode_tfs, tfs, cd_pairs = {}, [], []
             if candles:
                 tcols = st.columns(len(candles))
                 for col, cd in zip(tcols, candles):
                     with col:
-                        lbl(f'Timeframe for "{cd}" (one file each)')
+                        lbl(f'Cloud timeframe for "{cd}" (one file each)')
                         mode_tfs[cd] = checkbox_dropdown(f'Select timeframe - {cd}', list(TF), TF_DEFAULT.get(cd, ['1D']), f'tf_{CANDLE_OPTIONS[cd]}')
                     for tf_ in mode_tfs[cd]:
                         cd_pairs.append((cd, tf_))
                         if tf_ not in tfs:
                             tfs.append(tf_)
+                for cd_, tf_ in cd_pairs:                    # an interval not longer than the candle itself = same as "Every candle"
+                    code_ = CANDLE_OPTIONS[cd_]
+                    if code_ in INTERVAL_MIN and TF[tf_][1] >= pd.Timedelta(minutes=INTERVAL_MIN[code_]):
+                        st.caption(f'ℹ️ "{cd_}" with {tf_} candles = one lot on every candle (the candle is not shorter than the interval).')
                 if cd_pairs:
-                    st.caption('Files will be made for:  ' + '   |   '.join(f'{cd} → {", ".join(v) if v else "-"}' for cd, v in mode_tfs.items()))
+                    st.caption('Files will be made for (investment timeframe → cloud timeframe):  ' + '   |   '.join(f'{cd} → {", ".join(v) if v else "-"}' for cd, v in mode_tfs.items()))
             if max_open:
                 st.caption(f'Portfolio limit {max_open}: at most {max_open} stocks hold a position together (separately for every '
                            f'timeframe / lots / exit / entry / method combination). A waiting stock enters when a slot frees up.')
@@ -1776,7 +1791,7 @@ def page_file(topic, refresh, fol, fname):
                     st.warning(f"Cloud not ready: {dg['bars']} closed bars loaded, need 78+ (Angel returned too little history).")
                 else:
                     cl_ = dg['cloud']
-                    st.dataframe(pd.DataFrame([{'symbol': s['symbol'], 'latest_closed_bar': str(dg['last_bar'])[:16], 'close': round(cl_['close'], 2),
+                    show_df(pd.DataFrame([{'symbol': s['symbol'], 'latest_closed_bar': str(dg['last_bar'])[:16], 'close': round(cl_['close'], 2),
                                                 'cloud_top': round(cl_['top'], 2), 'cloud_bottom': round(cl_['bottom'], 2),
                                                 'price_vs_cloud': cl_['pos'], 'bars_loaded': dg['bars']}]), width='stretch', hide_index=True)
                     st.caption('Latest closed bar is before the start time, so it is only shown here - it does not trade.')
@@ -1785,7 +1800,7 @@ def page_file(topic, refresh, fol, fname):
                 prev = ev['tr']['Close'].iloc[-2] if len(ev['tr']) > 1 else None
                 pos = 'Above cloud' if last['Close'] > last['CloudTop'] else ('Below cloud' if last['Close'] < last['CloudBottom'] else 'Inside cloud')
                 st.caption('last closed bar = latest finished candle | change_% = vs previous bar close | cloud = Ichimoku (9/26/52, shift 26)')
-                st.dataframe(pd.DataFrame([{'symbol': s['symbol'], 'last_bar': str(last['Date'])[:16], 'close': round(float(last['Close']), 2),
+                show_df(pd.DataFrame([{'symbol': s['symbol'], 'last_bar': str(last['Date'])[:16], 'close': round(float(last['Close']), 2),
                                             'change_%': round((last['Close'] / prev - 1) * 100, 2) if prev else None,
                                             'cloud_top': round(float(last['CloudTop']), 2), 'cloud_bottom': round(float(last['CloudBottom']), 2),
                                             'price_vs_cloud': pos, 'signal': last['Signal'],
@@ -1797,7 +1812,7 @@ def page_file(topic, refresh, fol, fname):
             else:
                 sg = ev['tr'][ev['tr']['Signal'] != 'HOLD'][['Date', 'Signal', 'Close', 'Lots', 'AvgPrice', 'Unrealised %']]
                 sg = sg.sort_values('Date', ascending=False)
-                st.dataframe(sg, width='stretch', hide_index=True)
+                show_df(sg, width='stretch', hide_index=True)
                 csv_button('Download signals CSV', sg, f'signals_{key}')
         with tabs[2]:
             if ev is None or ev['last'] is None or ev['flat']:
@@ -1805,7 +1820,7 @@ def page_file(topic, refresh, fol, fname):
             else:
                 last = ev['last']
                 units = float(last['Qty'])
-                st.dataframe(pd.DataFrame([{'symbol': s['symbol'], 'lots': int(last['Lots']), 'avg_entry': round(float(last['AvgPrice']), 2),
+                show_df(pd.DataFrame([{'symbol': s['symbol'], 'lots': int(last['Lots']), 'avg_entry': round(float(last['AvgPrice']), 2),
                                             'units': round(units, 4), 'invested': round(units * float(last['AvgPrice']), 2),
                                             'last_close': round(float(last['Close']), 2), 'unrealised_%': last['Unrealised %'],
                                             'unrealised_pnl': round(ev['open_pnl'], 2)}]), width='stretch', hide_index=True)
@@ -1816,17 +1831,17 @@ def page_file(topic, refresh, fol, fname):
                 st.write('No closed trades yet.')
             else:
                 ct = closed.sort_values('Exit Date', ascending=False)
-                st.dataframe(ct, width='stretch', hide_index=True)
+                show_df(ct, width='stretch', hide_index=True)
                 csv_button('Download closed trades CSV', ct, f'closed_{key}')
         with tabs[4]:
             evs_ = pd.DataFrame(s.get('events', []))
             st.markdown('**Control events**')
-            st.dataframe(evs_.iloc[::-1] if not evs_.empty else pd.DataFrame([{'time': s.get('created', ''), 'event': 'Created'}]),
+            show_df(evs_.iloc[::-1] if not evs_.empty else pd.DataFrame([{'time': s.get('created', ''), 'event': 'Created'}]),
                          width='stretch', hide_index=True)
             if ev is not None and not ev['tr'].empty:
                 st.markdown('**Bar log (latest first)**')
                 bl = ev['tr'].sort_values('Date', ascending=False).head(300)
-                st.dataframe(bl, width='stretch', hide_index=True)
+                show_df(bl, width='stretch', hide_index=True)
                 csv_button('Download bar log CSV', bl, f'barlog_{key}')
 
     st.fragment(run_every=int(refresh))(body)()
@@ -1865,6 +1880,24 @@ def make_folder():
     if name:
         os.makedirs(os.path.join(user_dir(), safe(name)), exist_ok=True)
     st.session_state['new_folder_name'] = ''
+
+
+def show_df(df, **kw):
+    """st.dataframe - or, when the sidebar switch 'Light tables' is ON, a plain static table. The interactive table needs an extra
+    JavaScript file from the server (DataFrame.xxx.js); if the browser cannot fetch it ("TypeError: Failed to fetch dynamically
+    imported module") the light table still shows everything."""
+    if st.session_state.get('light_tables', True):
+        d = df.copy()
+        if len(d) > 400:
+            d = d.head(400)
+        try:
+            if kw.get('hide_index') and len(d.columns):
+                d = d.set_index(d.columns[0])
+        except Exception:
+            pass
+        st.table(d)
+        return
+    st.dataframe(df, **kw)
 
 
 def pnl_txt(x, pct=None):
@@ -1972,7 +2005,7 @@ def group_entry_view(fol, members, stats, evs, lim):
                          'Last exit': str(i['last_exit'])[:16] if i['last_exit'] is not None else '-',
                          'Entries': i['entries'], 'P&L': round(x['realized'] + x['unreal'], 2)})
         if rows:
-            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+            show_df(pd.DataFrame(rows), width='stretch', hide_index=True)
         else:
             st.caption('No stock has taken an entry yet.')
         if events:                                                  # replay in time order -> who holds a slot after every event
@@ -1998,7 +2031,7 @@ def group_entry_view(fol, members, stats, evs, lim):
                 log.append({'Bar time': str(tm)[:16], 'Stock': sym, 'What': what, 'Lots after': lots,
                             'Slots used': f'{len(inn)} / {lim}', 'Holding now': ', '.join(inn) or '-', 'Note': note})
             st.caption('Entry / exit order (latest first) - who holds the slots after every entry / exit')
-            st.dataframe(pd.DataFrame(log[::-1]), width='stretch', hide_index=True)
+            show_df(pd.DataFrame(log[::-1]), width='stretch', hide_index=True)
         flat_rows = []                                              # every stock that is NOT holding: why is it not entering?
         for f, s in waiting + exited:
             ev = evs.get((fol, f))
@@ -2030,7 +2063,7 @@ def group_entry_view(fol, members, stats, evs, lim):
             flat_rows.append(row)
         if flat_rows:
             st.caption(f'⏳ Not holding ({len(flat_rows)}): waiting for a first entry or a new signal')
-            st.dataframe(pd.DataFrame(flat_rows), width='stretch', hide_index=True)
+            show_df(pd.DataFrame(flat_rows), width='stretch', hide_index=True)
 
 
 def row_stats(s, ev, err, loading=False):
@@ -2266,7 +2299,7 @@ def page_view(topic, refresh):
                     for a_ in acts:
                         a_['Slot note'] = nt_.get((a_['Strategy'], a_['Bar time'], a_['Signal']), '')
                     st.caption(f'All signals since start ({len(acts)}) - latest first, scroll for the 1st lot / older entries')
-                    st.dataframe(pd.DataFrame(acts).sort_values('Bar time', ascending=False, kind='stable'),
+                    show_df(pd.DataFrame(acts).sort_values('Bar time', ascending=False, kind='stable'),
                                  width='stretch', hide_index=True, height=min(400, 38 * (len(acts) + 1)))
                 else:
                     st.caption('No signal yet - a strategy acts only when a candle CLOSES after its start time.')
@@ -2331,6 +2364,9 @@ def main():
     page = st.session_state.setdefault('page', 'strategies')      # ---- top navigation
     with st.sidebar:                                              # navigation on the left side
         st.markdown('### Live Paper Trading')
+        st.toggle('Light tables', value=True, key='light_tables',
+                  help='ON = plain tables (works even when the browser shows "TypeError: Failed to fetch dynamically imported module"). '
+                       'OFF = interactive tables (sortable, scrollable).')
         if st.button('📁 My Strategies', type='primary' if page == 'strategies' else 'secondary', width='stretch'):
             st.session_state['page'] = 'strategies'
             st.session_state.pop('open_file', None)
